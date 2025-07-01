@@ -2,12 +2,13 @@ import pyxel
 import random
 
 # --- 定数 ---
+# 画面設定
 SCREEN_WIDTH = 64
 SCREEN_HEIGHT = 16
 DIGIT_WIDTH = 8
 DIGIT_HEIGHT = 16
 
-# リソースファイル内の画像位置
+# リソースファイル設定
 IMG_BANK = 0
 IMG_V = 128
 
@@ -16,24 +17,26 @@ IMG_IDX_BLANK = 0
 IMG_IDX_NUM_START = 1
 IMG_IDX_UFO = 11
 IMG_IDX_LIVES_START = 12
+IMG_IDX_HYPHEN = 14  # 残機1の画像をハイフンとして利用
 
-# 画面上の桁の位置
+# 画面レイアウト
 PLAYER_DIGIT_POS = 0
 LIVES_DIGIT_POS = 1
 INVADER_START_POS = 2
 INVADER_COUNT = 6
-# インベーダーの列は画面の右から左へ並ぶ (位置7 -> 位置2)
 INVADER_RIGHTMOST_POS = INVADER_START_POS + INVADER_COUNT - 1
 
-# ゲームの状態
-STATE_PLAYING = 0
-STATE_ROUND_CLEAR = 1
-STATE_GAME_OVER = 2
+# ゲーム状態
+STATE_TITLE = 0
+STATE_PLAYING = 1
+STATE_ROUND_CLEAR = 2
+STATE_GAME_OVER = 3
+STATE_MISS_PAUSE = 4
 
-# プレイヤーの狙い (10をUFOとする)
-TARGET_UFO = 10
+# プレイヤーのターゲット定義
+TARGET_UFO = 10  # 0-9が数字、10をUFOとする
 
-# スコア (キーは画面上の桁位置)
+# スコア設定
 SCORE_MAP = {7: 60, 6: 50, 5: 40, 4: 30, 3: 20, 2: 10}
 SCORE_UFO = 300
 
@@ -51,11 +54,16 @@ class DigitalInvader:
             print(f"エラー: 'my_resource.pyxres'を読み込めませんでした。: {e}")
             pyxel.quit()
             return
-        self.reset_game()
+        self.reset_to_title()
         pyxel.run(self.update, self.draw)
 
-    def reset_game(self):
-        """ゲーム全体をリセットする"""
+    # --- ゲームの初期化・状態管理 ---
+    def reset_to_title(self):
+        """ゲーム全体をタイトル画面に戻す"""
+        self.game_state = STATE_TITLE
+
+    def start_new_game(self):
+        """新しいゲームを開始するための初期化"""
         self.score = 0
         self.lives = 3
         self.round = 0
@@ -65,192 +73,255 @@ class DigitalInvader:
         """新しいラウンドを開始する"""
         self.round += 1
         self.game_state = STATE_PLAYING
-        self.player_target = 0  # 0-9: 数字, 10: UFO
-
-        # インベーダーの列を管理するリスト
+        self.player_target = 0
         self.invader_line = []
-
+        self.line_offset = 0
         self.invaders_spawned_this_round = 0
         self.invaders_to_spawn = 16
         self.destroyed_digit_sum = 0
-
-        # ラウンドが進むごとに出現スピードを上げる
-        self.invader_spawn_speed = max(30, 90 - self.round * 10)
+        self.ufo_pending = False
+        self.last_ufo_spawn_sum = 0
+        self.invader_spawn_speed = max(15, 45 - self.round * 5)
         self.spawn_timer = 0
+        self.miss_pause_timer = 0
+        self.round_clear_timer = 0
 
+    # --- メインループ ---
     def update(self):
-        """ゲームの状態を更新する (毎フレーム呼ばれる)"""
-        if self.game_state == STATE_PLAYING:
-            self.update_playing()
-        elif self.game_state == STATE_ROUND_CLEAR:
-            if pyxel.btnp(pyxel.KEY_RETURN) or pyxel.btnp(pyxel.KEY_ENTER):
-                self.start_new_round()
-        elif self.game_state == STATE_GAME_OVER:
-            if pyxel.btnp(pyxel.KEY_RETURN) or pyxel.btnp(pyxel.KEY_ENTER):
-                self.reset_game()
+        """ゲームの状態を更新する（毎フレーム呼ばれる）"""
+        state_handlers = {
+            STATE_TITLE: self.update_title,
+            STATE_PLAYING: self.update_playing,
+            STATE_ROUND_CLEAR: self.update_round_clear,
+            STATE_GAME_OVER: self.update_game_over,
+            STATE_MISS_PAUSE: self.update_miss_pause,
+        }
+        handler = state_handlers.get(self.game_state)
+        if handler:
+            handler()
+
+    def draw(self):
+        """画面を描画する（毎フレーム呼ばれる）"""
+        pyxel.cls(0)
+        draw_handlers = {
+            STATE_TITLE: self.draw_title,
+            STATE_PLAYING: self.draw_playing_ui,
+            STATE_ROUND_CLEAR: self.draw_round_clear_ui,
+            STATE_GAME_OVER: self.draw_game_over_ui,
+            STATE_MISS_PAUSE: self.draw_miss_screen,
+        }
+        handler = draw_handlers.get(self.game_state)
+        if handler:
+            handler()
+
+    # --- 各ゲーム状態の更新処理 ---
+    def update_title(self):
+        """タイトル画面の更新処理"""
+        # RETURNキーが押されたらゲーム開始
+        if pyxel.btnp(pyxel.KEY_RETURN):
+            self.start_new_game()
 
     def update_playing(self):
         """プレイ中の更新処理"""
-        # --- プレイヤーの操作 (0-9の数字 + UFO の11種類) ---
+        self._handle_player_input()
+        self._handle_advance_and_spawn()
+        self._check_miss()
+        self._check_round_clear()
+
+    def update_round_clear(self):
+        """ラウンドクリア画面の更新処理"""
+        self.round_clear_timer += 1
+        if self.round_clear_timer > 90:  # 3秒経過
+            self.start_new_round()
+
+    def update_game_over(self):
+        """ゲームオーバー画面の更新処理"""
+        # RETURNキーが押されたらタイトルへ
+        if pyxel.btnp(pyxel.KEY_RETURN):
+            self.reset_to_title()
+
+    def update_miss_pause(self):
+        """ミス後のポーズ処理"""
+        self.miss_pause_timer += 1
+        if self.miss_pause_timer > 60:  # 2秒経過
+            self._resume_after_miss()
+
+    # --- ゲームロジックのヘルパー関数 ---
+    def _handle_player_input(self):
+        """プレイヤーのキー入力を処理する"""
+        # 右カーソルキーのみで進める（戻れない）
         if pyxel.btnp(pyxel.KEY_RIGHT):
             self.player_target = (self.player_target + 1) % 11
-        if pyxel.btnp(pyxel.KEY_LEFT):
-            self.player_target = (self.player_target - 1 + 11) % 11
         if pyxel.btnp(pyxel.KEY_CTRL):
-            self.shoot()
+            self._shoot()
 
-        # --- 敵の出現 ---
+    def _handle_advance_and_spawn(self):
+        """敵の侵攻と出現を管理する"""
         self.spawn_timer += 1
-        # インベーダーの列に空きがあり、ラウンドの出現上限に達していなければ出現
-        if (
-            len(self.invader_line) < INVADER_COUNT
-            and self.spawn_timer >= self.invader_spawn_speed
-            and self.invaders_spawned_this_round < self.invaders_to_spawn
-        ):
-            self.spawn_timer = 0
-            self.spawn_invader()
+        if self.spawn_timer < self.invader_spawn_speed:
+            return
+        self.spawn_timer = 0
 
-        # --- 侵攻によるミス判定 ---
-        if len(self.invader_line) >= INVADER_COUNT:
-            self.lose_life()
+        can_spawn_more = self.invaders_spawned_this_round < self.invaders_to_spawn
+        line_has_space = len(self.invader_line) < INVADER_COUNT
 
-        # --- ラウンドクリア判定 ---
-        # ラウンドの敵をすべて出現させ、かつ画面上の敵をすべて倒したらクリア
+        if can_spawn_more and line_has_space:
+            if self.ufo_pending and not any(
+                e["type"] == "ufo" for e in self.invader_line
+            ):
+                self._spawn_ufo()
+                self.ufo_pending = False
+            else:
+                self._spawn_invader()
+        elif self.invader_line:
+            self.line_offset += 1
+
+    def _check_miss(self):
+        """侵攻されすぎてミスになるかチェックする"""
+        if not self.invader_line:
+            return
+
+        leftmost_invader_index = len(self.invader_line) - 1
+        leftmost_invader_pos = (
+            INVADER_RIGHTMOST_POS - leftmost_invader_index - self.line_offset
+        )
+
+        if leftmost_invader_pos < INVADER_START_POS:
+            self.game_state = STATE_MISS_PAUSE
+            self.miss_pause_timer = 0
+
+    def _check_round_clear(self):
+        """ラウンドクリア条件をチェックする"""
         if (
             self.invaders_spawned_this_round >= self.invaders_to_spawn
             and not self.invader_line
         ):
             self.game_state = STATE_ROUND_CLEAR
+            self.round_clear_timer = 0
 
-    def shoot(self):
-        """プレイヤーが選択した対象を攻撃し、列を詰める"""
-        new_line = []
+    def _resume_after_miss(self):
+        """ミスから復帰する"""
+        self.lives -= 1
+        if self.lives <= 0:
+            self.game_state = STATE_GAME_OVER
+        else:
+            self.player_target = 0
+            self.invader_line = []
+            self.line_offset = 0
+            self.game_state = STATE_PLAYING
+
+    def _shoot(self):
+        """弾を発射し、敵を一体破壊する"""
         hit = False
         target_is_ufo = self.player_target == TARGET_UFO
 
-        for i, enemy in enumerate(self.invader_line):
-            destroyed = False
-            # UFOを狙っている場合
-            if target_is_ufo:
-                if enemy["type"] == "ufo":
-                    destroyed = True
-                    self.score += SCORE_UFO
-            # 数字を狙っている場合
-            else:
-                if enemy["type"] == "invader" and enemy["value"] == self.player_target:
-                    destroyed = True
-                    pos_on_screen = INVADER_RIGHTMOST_POS - i
-                    self.score += SCORE_MAP.get(pos_on_screen, 0)
-                    self.destroyed_digit_sum += enemy["value"]
+        for i in range(len(self.invader_line) - 1, -1, -1):
+            enemy = self.invader_line[i]
+            should_destroy = False
 
-            if destroyed:
+            if target_is_ufo and enemy["type"] == "ufo":
+                should_destroy = True
+                self.score += SCORE_UFO
+            elif (
+                not target_is_ufo
+                and enemy["type"] == "invader"
+                and enemy["value"] == self.player_target
+            ):
+                should_destroy = True
+                pos_on_screen = INVADER_RIGHTMOST_POS - i - self.line_offset
+                self.score += SCORE_MAP.get(pos_on_screen, 0)
+                self.destroyed_digit_sum += enemy["value"]
+
+            if should_destroy:
                 hit = True
-            else:
-                new_line.append(enemy)
+                self.invader_line.pop(i)
+                break
 
-        # 列を新しいものに更新（撃破した後退処理）
-        self.invader_line = new_line
+        if (
+            hit
+            and self.destroyed_digit_sum > 0
+            and self.destroyed_digit_sum % 10 == 0
+            and self.destroyed_digit_sum > self.last_ufo_spawn_sum
+        ):
+            self.ufo_pending = True
+            self.last_ufo_spawn_sum = self.destroyed_digit_sum
 
-        # UFO出現判定 (UFOは画面に1体まで)
-        if hit and self.destroyed_digit_sum > 0 and self.destroyed_digit_sum % 10 == 0:
-            if not any(e["type"] == "ufo" for e in self.invader_line):
-                self.spawn_ufo()
-
-    def spawn_invader(self):
+    def _spawn_invader(self):
         """新しいインベーダーを列の右端に追加する"""
         self.invaders_spawned_this_round += 1
-        new_invader = {
-            "type": "invader",
-            "value": random.randint(0, 9),
-        }
-        # 右端に追加（リストの先頭に追加して、描画時に右から表示する）
+        new_invader = {"type": "invader", "value": random.randint(0, 9)}
         self.invader_line.insert(0, new_invader)
 
-    def spawn_ufo(self):
+    def _spawn_ufo(self):
         """UFOを列の右端に追加する"""
-        new_ufo = {
-            "type": "ufo",
-            # UFOを倒すのに数字は不要になった
-        }
-        # 右端に追加（リストの先頭に追加して、描画時に右から表示する）
+        new_ufo = {"type": "ufo", "value": None}
         self.invader_line.insert(0, new_ufo)
 
-    def lose_life(self):
-        """ライフが減る処理"""
-        self.lives -= 1
-        # 画面上の敵をリセット
-        self.invader_line = []
-        if self.lives <= 0:
-            self.game_state = STATE_GAME_OVER
-
-    def draw(self):
-        """画面を描画する"""
-        pyxel.cls(0)
-        if self.game_state == STATE_GAME_OVER:
-            self.draw_text_centered("GAME OVER")
-            self.draw_text_centered("PRESS ENTER", 6)
-        elif self.game_state == STATE_ROUND_CLEAR:
-            self.draw_round_number()
-            self.draw_score()
-            self.draw_text_centered("PRESS ENTER", 6)
-        elif self.game_state == STATE_PLAYING:
-            self.draw_playing_ui()
-            self.draw_invader_line()
+    # --- 描画関連のヘルパー関数 ---
+    def draw_title(self):
+        """タイトル画面を描画"""
+        for i in range(8):
+            self._draw_digit(i, IMG_IDX_HYPHEN)
 
     def draw_playing_ui(self):
-        """プレイ中のUIを描画"""
-        # プレイヤーの狙う対象を描画
+        """プレイ中のUIと敵を描画する"""
         if self.player_target == TARGET_UFO:
-            img_idx = IMG_IDX_UFO
+            self._draw_digit(PLAYER_DIGIT_POS, IMG_IDX_UFO)
         else:
-            img_idx = self.player_target + IMG_IDX_NUM_START
-        self.draw_digit(PLAYER_DIGIT_POS, img_idx)
+            self._draw_digit(PLAYER_DIGIT_POS, self.player_target + IMG_IDX_NUM_START)
 
-        # 残機
         if self.lives > 0:
-            lives_img_idx = IMG_IDX_LIVES_START + (3 - self.lives)
-            self.draw_digit(LIVES_DIGIT_POS, lives_img_idx)
+            self._draw_digit(LIVES_DIGIT_POS, IMG_IDX_LIVES_START + (3 - self.lives))
         else:
-            self.draw_digit(LIVES_DIGIT_POS, IMG_IDX_BLANK)
+            self._draw_digit(LIVES_DIGIT_POS, IMG_IDX_BLANK)
 
-    def draw_invader_line(self):
-        """インベーダーの列を描画"""
         for i, enemy in enumerate(self.invader_line):
-            # 画面上の位置を計算（右から詰めて描画）
-            pos_on_screen = INVADER_RIGHTMOST_POS - i
+            pos = INVADER_RIGHTMOST_POS - i - self.line_offset
+            if INVADER_START_POS <= pos <= INVADER_RIGHTMOST_POS:
+                img_idx = (
+                    IMG_IDX_UFO
+                    if enemy["type"] == "ufo"
+                    else enemy["value"] + IMG_IDX_NUM_START
+                )
+                self._draw_digit(pos, img_idx)
 
-            if enemy["type"] == "invader":
-                img_idx = enemy["value"] + IMG_IDX_NUM_START
-            else:  # ufo
-                img_idx = IMG_IDX_UFO
-            self.draw_digit(pos_on_screen, img_idx)
+    def draw_round_clear_ui(self):
+        """ラウンドクリア画面を描画"""
+        next_round_digit = (self.round + 1) % 10
+        self._draw_digit(PLAYER_DIGIT_POS, next_round_digit + IMG_IDX_NUM_START)
+        self._draw_digit(LIVES_DIGIT_POS, IMG_IDX_HYPHEN)
+        self._draw_score()
 
-    def draw_round_number(self):
-        """ラウンド数を描画"""
+    def draw_game_over_ui(self):
+        """ゲームオーバー画面を描画"""
+        self._draw_round_number()
+        self._draw_digit(LIVES_DIGIT_POS, IMG_IDX_BLANK)
+        self._draw_score()
+
+    def draw_miss_screen(self):
+        """ミス発生時の画面を描画"""
+        self._draw_round_number()
+        self._draw_digit(LIVES_DIGIT_POS, IMG_IDX_HYPHEN)
+        self._draw_score()
+
+    def _draw_round_number(self):
+        """現在のラウンド数を描画"""
         round_digit = self.round % 10
-        img_idx = round_digit + IMG_IDX_NUM_START
-        self.draw_digit(PLAYER_DIGIT_POS, img_idx)
+        self._draw_digit(PLAYER_DIGIT_POS, round_digit + IMG_IDX_NUM_START)
 
-    def draw_score(self):
+    def _draw_score(self):
         """スコアを6桁で描画"""
         score_str = f"{self.score:06}"
         for i in range(INVADER_COUNT):
             digit = int(score_str[i])
-            img_idx = digit + IMG_IDX_NUM_START
-            self.draw_digit(INVADER_START_POS + i, img_idx)
+            pos = INVADER_START_POS + i
+            self._draw_digit(pos, digit + IMG_IDX_NUM_START)
 
-    def draw_digit(self, pos_x_idx, img_idx):
+    def _draw_digit(self, pos_x_idx, img_idx):
         """指定桁に画像を描画"""
-        screen_x = pos_x_idx * DIGIT_WIDTH
-        img_u = img_idx * DIGIT_WIDTH
-        pyxel.blt(screen_x, 0, IMG_BANK, img_u, IMG_V, DIGIT_WIDTH, DIGIT_HEIGHT, 0)
-
-    def draw_text_centered(self, text, y_offset=0):
-        """画面中央にテキストを描画"""
-        text_width = len(text) * pyxel.FONT_WIDTH
-        x = (SCREEN_WIDTH - text_width) / 2
-        y = (SCREEN_HEIGHT - pyxel.FONT_HEIGHT) / 2 + y_offset
-        pyxel.text(x, y, text, 7)
+        x = pos_x_idx * DIGIT_WIDTH
+        u = img_idx * DIGIT_WIDTH
+        pyxel.blt(x, 0, IMG_BANK, u, IMG_V, DIGIT_WIDTH, DIGIT_HEIGHT, 0)
 
 
 DigitalInvader()
